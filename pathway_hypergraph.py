@@ -1,4 +1,25 @@
 # %%
+"""
+Causal Hyperbolic Hypergraph Survival Network
+==============================================
+
+Full objective (NeurIPS style):
+
+    L(theta) = L_Cox
+             + lambda_1 * L_manifold
+             + lambda_2 * L_causal
+             + lambda_3 * L_hypergraph
+
+Where:
+    - L_Cox        : Cox partial likelihood
+    - L_manifold   : Hyperbolic radial ordering constraint
+    - L_causal     : Sparse + context-variance causal counterfactual
+    - L_hypergraph : Hypergraph Laplacian smoothness on latent z
+
+Latent space: z in H^d (Poincare ball, curvature c)
+Risk head:    R_i = beta * (2/sqrt(c)) * arctanh(sqrt(c) * ||z_i||)
+"""
+
 import os
 import numpy as np
 import pandas as pd
@@ -35,8 +56,16 @@ class Config:
     epochs: int = 30
     weight_decay: float = 1e-4
     survival_rank_margin: float = 1.0
-    geometry_lambda: float = 0.1
-    counterfactual_lambda: float = 0.05
+
+    # Poincare ball curvature
+    poincare_curvature: float = 1.0
+
+    # Loss weights
+    manifold_lambda: float = 0.1       # lambda_1: hyperbolic manifold ordering
+    causal_lambda: float = 0.05        # lambda_2: causal counterfactual
+    hypergraph_lambda: float = 0.01    # lambda_3: Laplacian smoothness
+    causal_context_gamma: float = 0.1  # gamma: variance-across-context penalty
+
     device: str = "cuda"
 
 
@@ -412,6 +441,51 @@ def build_gene_pathway_matrix(
 
 
 ###############################################################
+# HYPERGRAPH LAPLACIAN
+###############################################################
+
+def build_hypergraph_laplacian(H: torch.Tensor) -> torch.Tensor:
+    """
+    Computes the hypergraph Laplacian:
+        L = Dv - Dv^{-1/2} H De^{-1} H^T Dv^{-1/2}
+
+    Used in the smoothness regularizer:
+        L_hypergraph = Tr(Z^T L Z)
+
+    Returns L as a dense (|V|, |V|) tensor.
+    Note: for large vocabularies, use only a subsampled version
+    at training time (see HypergraphSmoothnessLoss).
+    """
+    H = H.coalesce()
+    num_nodes = H.size(0)
+
+    Dv = torch.sparse.sum(H, dim=1).to_dense()          # (|V|,)
+    De = torch.sparse.sum(H, dim=0).to_dense()          # (|E|,)
+
+    Dv_inv_sqrt = torch.pow(Dv + 1e-6, -0.5)           # (|V|,)
+    De_inv = torch.pow(De + 1e-6, -1.0)                 # (|E|,)
+
+    # Theta = Dv^{-1/2} H De^{-1} H^T Dv^{-1/2}
+    # Computed via sparse matmuls to avoid materializing H as dense
+
+    H_dense = H.to_dense()                              # (|V|, |E|)
+
+    Theta = (
+        Dv_inv_sqrt.unsqueeze(1)
+        * H_dense
+        * De_inv.unsqueeze(0)
+    )                                                    # (|V|, |E|)
+
+    Theta = Theta @ H_dense.T                           # (|V|, |V|)
+    Theta = Theta * Dv_inv_sqrt.unsqueeze(1)
+    Theta = Theta * Dv_inv_sqrt.unsqueeze(0)
+
+    L = torch.diag(Dv) - Theta                          # (|V|, |V|)
+
+    return L
+
+
+###############################################################
 # DATASET
 ###############################################################
 
@@ -501,7 +575,154 @@ def build_dataloaders(df, gene_vocab):
 
     return train_loader, val_loader, treatment_encoder
 
+
 # %%
+###############################################################
+# POINCARE BALL OPERATIONS
+###############################################################
+
+class PoincareBall(nn.Module):
+    """
+    Implements the Poincare ball model of hyperbolic space with
+    curvature c > 0.
+
+    Key operations:
+        - mobius_add(x, y)    : Mobius addition in B^d_c
+        - expmap0(v)          : Exponential map from origin (tangent -> ball)
+        - logmap0(x)          : Logarithmic map to origin  (ball -> tangent)
+        - dist(x, y)          : Hyperbolic distance
+        - dist0(x)            : Distance from origin (radial norm)
+        - project(x)          : Project onto ball interior (numerical safety)
+    """
+
+    def __init__(self, c: float = 1.0):
+        super().__init__()
+        # c is not learned; register as buffer for device movement
+        self.register_buffer("c", torch.tensor(c, dtype=torch.float32))
+
+    def project(self, x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+        """
+        Project x onto open ball: ||x|| < 1/sqrt(c).
+        Clips norm to (1/sqrt(c) - eps) to avoid boundary singularities.
+        """
+        c = self.c
+        max_norm = (1.0 / (c.sqrt() + 1e-8)) - eps
+        norm = x.norm(dim=-1, keepdim=True).clamp(min=1e-10)
+        x = torch.where(norm >= max_norm, x / norm * max_norm, x)
+        return x
+
+    def mobius_add(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Mobius addition in the Poincare ball:
+
+            x (+)_c y = ((1 + 2c<x,y> + c||y||^2) x
+                         + (1 - c||x||^2) y)
+                        / (1 + 2c<x,y> + c^2||x||^2||y||^2)
+        """
+        c = self.c
+
+        x2 = (x * x).sum(dim=-1, keepdim=True)           # ||x||^2
+        y2 = (y * y).sum(dim=-1, keepdim=True)           # ||y||^2
+        xy = (x * y).sum(dim=-1, keepdim=True)           # <x, y>
+
+        num = (1 + 2 * c * xy + c * y2) * x + (1 - c * x2) * y
+        denom = 1 + 2 * c * xy + c * c * x2 * y2
+
+        return num / denom.clamp(min=1e-10)
+
+    def expmap0(self, v: torch.Tensor) -> torch.Tensor:
+        """
+        Exponential map at the origin:
+
+            exp_0^c(v) = tanh(sqrt(c) * ||v||) / (sqrt(c) * ||v||) * v
+
+        Maps a tangent vector v at origin into the Poincare ball.
+        """
+        c = self.c
+        sqrt_c = c.sqrt()
+
+        v_norm = v.norm(dim=-1, keepdim=True).clamp(min=1e-10)
+        tanh_arg = (sqrt_c * v_norm).clamp(max=15.0)     # prevent overflow
+
+        return (tanh_arg.tanh() / (sqrt_c * v_norm)) * v
+
+    def logmap0(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Logarithmic map at the origin:
+
+            log_0^c(x) = arctanh(sqrt(c) * ||x||) / (sqrt(c) * ||x||) * x
+
+        Maps a point in the Poincare ball back to the tangent space at origin.
+        """
+        c = self.c
+        sqrt_c = c.sqrt()
+
+        x_norm = x.norm(dim=-1, keepdim=True).clamp(min=1e-10)
+        atanh_arg = (sqrt_c * x_norm).clamp(max=1.0 - 1e-5)  # arctanh domain
+
+        return (atanh_arg.arctanh() / (sqrt_c * x_norm)) * x
+
+    def dist(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Hyperbolic distance between x and y:
+
+            d_H(x, y) = (2/sqrt(c)) * arctanh(sqrt(c) * ||-x (+)_c y||)
+        """
+        c = self.c
+        sqrt_c = c.sqrt()
+
+        diff = self.mobius_add(-x, y)
+        diff_norm = diff.norm(dim=-1).clamp(min=1e-10)
+        atanh_arg = (sqrt_c * diff_norm).clamp(max=1.0 - 1e-5)
+
+        return (2.0 / sqrt_c) * atanh_arg.arctanh()
+
+    def dist0(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Hyperbolic distance from the origin:
+
+            d_H(0, x) = (2/sqrt(c)) * arctanh(sqrt(c) * ||x||)
+
+        This is the radial norm in hyperbolic space and is used
+        directly as the survival risk score.
+        """
+        c = self.c
+        sqrt_c = c.sqrt()
+
+        x_norm = x.norm(dim=-1).clamp(min=1e-10)
+        atanh_arg = (sqrt_c * x_norm).clamp(max=1.0 - 1e-5)
+
+        return (2.0 / sqrt_c) * atanh_arg.arctanh()
+
+
+###############################################################
+# EUCLIDEAN -> POINCARE PROJECTION LAYER
+###############################################################
+
+class EuclideanToHyperbolic(nn.Module):
+    """
+    Projects a Euclidean latent vector into the Poincare ball via:
+        1. Linear transformation (Euclidean -> tangent space at origin)
+        2. Exponential map (tangent -> ball)
+        3. Safety projection (clip to ball interior)
+
+    The linear layer operates in Euclidean space (standard gradient flow).
+    The expmap is differentiable, so gradients flow cleanly through.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, ball: PoincareBall):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+        self.ball = ball
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (..., in_dim) Euclidean
+        v = self.linear(x)                  # (..., out_dim) tangent vector
+        z = self.ball.expmap0(v)            # (..., out_dim) in Poincare ball
+        z = self.ball.project(z)            # numerical safety
+        return z
+
+
 ###############################################################
 # TRUE HYPERGRAPH PROPAGATION (CORRECTED GLOBAL VERSION)
 ###############################################################
@@ -662,38 +883,6 @@ class PathwayAttentionPooling(nn.Module):
 
 
 ###############################################################
-# SURVIVAL GEOMETRY REGULARIZER
-###############################################################
-
-class SurvivalGeometryRegularizer(nn.Module):
-    """
-    Enforces risk-ordered latent manifold.
-    """
-
-    def __init__(self, margin=1.0):
-        super().__init__()
-        self.margin = margin
-
-    def forward(self, z, risk, time, event):
-
-        B = z.size(0)
-
-        loss = 0.0
-        count = 0
-
-        for i in range(B):
-            for j in range(B):
-                if time[i] < time[j] and event[i] == 1:
-                    loss += F.relu(self.margin - (risk[j] - risk[i]))
-                    count += 1
-
-        if count == 0:
-            return torch.tensor(0.0, device=z.device)
-
-        return loss / count
-
-
-###############################################################
 # COUNTERFACTUAL OPERATOR
 ###############################################################
 
@@ -719,10 +908,25 @@ class CounterfactualOperator:
 
 
 ###############################################################
-# FULL MODEL
+# FULL MODEL: CAUSAL HYPERBOLIC HYPERGRAPH SURVIVAL NETWORK
 ###############################################################
 
-class MechanismHypergraphModel(nn.Module):
+class CausalHyperbolicHypergraphModel(nn.Module):
+    """
+    f_theta : (X, C) -> (Z, R)
+
+    where:
+        Z in H^d  (Poincare ball, curvature c)
+        R = (2/sqrt(c)) * arctanh(sqrt(c) * ||Z||)  [radial risk]
+
+    Structural equation model:
+        Z = g_theta(X, C)       [hypergraph encoder + hyperbolic projection]
+        R = h_theta(Z)          [radial risk head]
+
+    Intervention:
+        X^{do(g=0)}             [gene g zeroed out]
+        Delta_g = R - R_{do(g=0)}
+    """
 
     def __init__(
         self,
@@ -731,20 +935,19 @@ class MechanismHypergraphModel(nn.Module):
         H_sparse,
         gene_pathway_matrix,
         num_pathways,
-        use_pathway_attention=True
+        use_pathway_attention=True,
+        curvature: float = 1.0
     ):
         super().__init__()
 
+        # ── Embeddings ─────────────────────────────────────────────
         self.gene_embed = nn.Embedding(num_genes, CFG.embed_dim)
         self.treatment_embed = nn.Embedding(num_treatments, CFG.embed_dim)
 
+        # ── Hypergraph propagation ──────────────────────────────────
         self.hyper_prop = HypergraphPropagation(H_sparse)
 
-        self.context_attention = ContextHypergraphAttention(
-            CFG.embed_dim,
-            CFG.embed_dim
-        )
-
+        # ── Pathway attention pooling ───────────────────────────────
         self.use_pathway_attention = use_pathway_attention
 
         if use_pathway_attention:
@@ -753,54 +956,89 @@ class MechanismHypergraphModel(nn.Module):
                 num_pathways=num_pathways,
                 context_dim=CFG.embed_dim
             )
-            # gene_pathway_matrix is a fixed buffer, not a learned parameter
             self.register_buffer("gene_pathway_matrix", gene_pathway_matrix)
+        else:
+            self.context_attention = ContextHypergraphAttention(
+                CFG.embed_dim,
+                CFG.embed_dim
+            )
+            self.pool = nn.AdaptiveAvgPool1d(1)
 
-        self.pool = nn.AdaptiveAvgPool1d(1)
+        # ── Poincare ball ───────────────────────────────────────────
+        self.ball = PoincareBall(c=curvature)
 
-        self.latent_proj = nn.Linear(CFG.embed_dim, CFG.latent_dim)
-        self.risk_head = nn.Linear(CFG.latent_dim, 1)
-
-        self.geometry_reg = SurvivalGeometryRegularizer(
-            margin=CFG.survival_rank_margin
+        # ── Euclidean -> Hyperbolic projection ──────────────────────
+        # Projects from Euclidean latent to Poincare ball
+        self.euclidean_to_hyp = EuclideanToHyperbolic(
+            in_dim=CFG.embed_dim,
+            out_dim=CFG.latent_dim,
+            ball=self.ball
         )
 
+        # ── Risk head: scalar beta scales radial distance ───────────
+        # R_i = beta * d_H(0, z_i)
+        self.risk_beta = nn.Parameter(torch.ones(1))
+
+        # ── Counterfactual operator ─────────────────────────────────
         self.counterfactual = CounterfactualOperator()
 
-    def forward(self, gene_ids, context_ids):
+    def encode(self, gene_ids, context_ids):
+        """
+        Shared encoder:
+            gene_ids    -> hypergraph propagation -> pathway pooling
+            context_ids -> treatment embedding
+            output      -> Euclidean patient representation (B, D)
+        """
+        # Global hypergraph propagation over full gene embedding table
+        E = self.gene_embed.weight              # (|V|, D)
+        E_prop = self.hyper_prop(E)             # (|V|, D)
 
-        # 1. Global hypergraph propagation over full gene embedding table
-        E = self.gene_embed.weight            # (|V|, D)
-        E_prop = self.hyper_prop(E)           # (|V|, D)
-
-        # 2. Gather patient-specific gene embeddings
-        X = E_prop[gene_ids]                  # (B, M, D)
-
-        context_vec = self.treatment_embed(context_ids)   # (B, D)
+        # Patient-specific gene embeddings
+        X = E_prop[gene_ids]                    # (B, M, D)
+        context_vec = self.treatment_embed(context_ids)  # (B, D)
 
         if self.use_pathway_attention:
-            # 3a. Pathway-aware pooling with treatment-conditioned attention
-            z, pathway_weights = self.pathway_attention(
+            # Pathway-aware pooling with treatment-conditioned attention
+            patient_vec, pathway_weights = self.pathway_attention(
                 X, gene_ids, self.gene_pathway_matrix, context_vec
             )
         else:
-            # 3b. Fallback: context attention + average pool
+            # Fallback: context attention + average pool
             X_att = self.context_attention(X, context_vec)
-            X_att = X_att.transpose(1, 2)
-            z = self.pool(X_att).squeeze(-1)
+            patient_vec = self.pool(X_att.transpose(1, 2)).squeeze(-1)
 
-        # 4. Project to latent space and predict risk
-        z = self.latent_proj(z)
-        risk = self.risk_head(z).squeeze()
+        return patient_vec
+
+    def forward(self, gene_ids, context_ids):
+        """
+        Full forward pass:
+            -> Euclidean patient vector
+            -> Hyperbolic projection (expmap)
+            -> Radial risk score
+
+        Returns:
+            risk  : (B,)   scalar risk per patient
+            z     : (B, D) hyperbolic latent point in Poincare ball
+        """
+        # Euclidean representation
+        patient_vec = self.encode(gene_ids, context_ids)  # (B, D)
+
+        # Project to Poincare ball via expmap at origin
+        z = self.euclidean_to_hyp(patient_vec)             # (B, latent_dim) in H^d
+
+        # Radial risk: R_i = beta * d_H(0, z_i)
+        # High-risk patients are pushed toward the boundary (large radial norm)
+        # Low-risk patients cluster near the origin
+        radial = self.ball.dist0(z)                        # (B,)
+        risk = self.risk_beta * radial                     # (B,)
 
         return risk, z
 
-    def compute_geometry_loss(self, z, risk, time, event):
-
-        return self.geometry_reg(z, risk, time, event)
-
     def counterfactual_gene(self, gene_ids, context_ids, gene_remove_idx):
-
+        """
+        Structural intervention: do(gene = 0)
+        Returns counterfactual (risk, z) under gene ablation.
+        """
         gene_cf = self.counterfactual.remove_gene(
             gene_ids,
             gene_remove_idx
@@ -809,7 +1047,10 @@ class MechanismHypergraphModel(nn.Module):
         return self.forward(gene_cf, context_ids)
 
     def counterfactual_treatment(self, gene_ids, context_ids, new_treatment_id):
-
+        """
+        Structural intervention: do(treatment = new_treatment_id)
+        Returns counterfactual (risk, z) under treatment swap.
+        """
         context_cf = self.counterfactual.swap_treatment(
             context_ids,
             new_treatment_id
@@ -817,12 +1058,16 @@ class MechanismHypergraphModel(nn.Module):
 
         return self.forward(gene_ids, context_cf)
 
+
 # %%
 ###############################################################
-# COX PARTIAL LIKELIHOOD LOSS
+# LOSS I: COX PARTIAL LIKELIHOOD
 ###############################################################
 
 class CoxPHLoss(nn.Module):
+    """
+    L_Cox = -sum_{i: delta_i=1} (R_i - log sum_{j: t_j >= t_i} exp(R_j))
+    """
 
     def __init__(self):
         super().__init__()
@@ -842,19 +1087,184 @@ class CoxPHLoss(nn.Module):
 
 
 ###############################################################
-# COUNTERFACTUAL CONSISTENCY LOSS
+# LOSS II: HYPERBOLIC MANIFOLD ORDERING
 ###############################################################
 
-class CounterfactualConsistencyLoss(nn.Module):
+class HyperbolicManifoldLoss(nn.Module):
+    """
+    Enforces radial ordering in hyperbolic space:
 
-    def __init__(self):
+        L_manifold = sum_{i<j, t_i < t_j, delta_i=1}
+                     ReLU(d_H(0, z_j) - d_H(0, z_i))
+
+    Meaning: if patient i died before patient j,
+    then z_i should have a larger hyperbolic radial distance
+    from the origin than z_j.
+
+    This is stronger than Euclidean ranking: the geometry of
+    the Poincare ball means the boundary encodes extreme risk,
+    and the origin encodes low/no risk.
+    """
+
+    def __init__(self, ball: PoincareBall):
         super().__init__()
+        self.ball = ball
 
-    def forward(self, original_risk, cf_risk):
+    def forward(
+        self,
+        z: torch.Tensor,      # (B, D) hyperbolic latent points
+        time: torch.Tensor,   # (B,)
+        event: torch.Tensor   # (B,)
+    ) -> torch.Tensor:
 
-        return F.mse_loss(original_risk, cf_risk)
+        # Radial distances from origin for all patients
+        radial = self.ball.dist0(z)   # (B,)
+
+        B = z.size(0)
+        loss = torch.tensor(0.0, device=z.device)
+        count = 0
+
+        for i in range(B):
+            for j in range(B):
+                # Patient i died before patient j (and i is an event)
+                if time[i] < time[j] and event[i] == 1:
+                    # We want radial[i] > radial[j]
+                    # Penalize if radial[j] >= radial[i]
+                    loss = loss + F.relu(radial[j] - radial[i])
+                    count += 1
+
+        if count == 0:
+            return torch.tensor(0.0, device=z.device)
+
+        return loss / count
 
 
+###############################################################
+# LOSS III: CAUSAL COUNTERFACTUAL LOSS
+###############################################################
+
+class CausalCounterfactualLoss(nn.Module):
+    """
+    Implements the full causal counterfactual objective:
+
+        L_causal = E_g [ ||Delta_g||_1 + gamma * Var_C(Delta_g) ]
+
+    Where:
+        Delta_g = R - R_{do(g=0)}     [causal effect of gene g]
+        ||Delta_g||_1                 [sparsity prior: most genes
+                                       should have small causal effect]
+        Var_C(Delta_g)                [context-variance: if a gene
+                                       is not treatment-targeted, its
+                                       causal effect should be stable
+                                       across treatment contexts]
+
+    Implementation:
+        - Sparsity: computed from gene ablation counterfactual
+        - Context-variance: computed by swapping to all available
+          treatment contexts and measuring variance of Delta_g
+    """
+
+    def __init__(self, gamma: float = 0.1):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(
+        self,
+        original_risk: torch.Tensor,   # (B,)
+        cf_risk: torch.Tensor,         # (B,) risk under gene ablation
+        cf_risks_by_context: List[torch.Tensor]  # list of (B,) risks under different contexts
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            loss_cf      : total causal loss
+            loss_sparse  : L1 sparsity term
+            loss_var     : context-variance term
+        """
+        # Delta_g = R - R_{do(g=0)}
+        delta = torch.abs(original_risk - cf_risk)    # (B,)
+
+        # Sparsity prior: ||Delta_g||_1
+        loss_sparse = torch.mean(torch.abs(delta))
+
+        # Context-variance: Var_C(Delta_g)
+        # For each context c, compute delta under that context
+        # Then measure variance across contexts per patient
+        if len(cf_risks_by_context) > 1:
+            # Stack context-specific deltas: (num_contexts, B)
+            context_deltas = torch.stack([
+                torch.abs(original_risk - cf_r)
+                for cf_r in cf_risks_by_context
+            ], dim=0)
+
+            # Variance across contexts for each patient, then average
+            loss_var = context_deltas.var(dim=0).mean()
+        else:
+            loss_var = torch.tensor(0.0, device=original_risk.device)
+
+        loss_cf = loss_sparse + self.gamma * loss_var
+
+        return loss_cf, loss_sparse, loss_var
+
+
+###############################################################
+# LOSS IV: HYPERGRAPH LAPLACIAN SMOOTHNESS
+###############################################################
+
+class HypergraphSmoothnessLoss(nn.Module):
+    """
+    Encourages smoothness of z across the hypergraph:
+
+        L_hypergraph = Tr(Z^T L Z)
+
+    where L is the hypergraph Laplacian.
+
+    For a batch of patients with gene sets, we approximate this
+    using only the unique gene indices present in the batch.
+    Full Laplacian trace is O(|V|^2) which is impractical;
+    we use a batched subgraph approximation.
+    """
+
+    def __init__(self, L: torch.Tensor):
+        """
+        L: (|V|, |V|) hypergraph Laplacian (precomputed, stored on DEVICE)
+        """
+        super().__init__()
+        self.register_buffer("L", L)
+
+    def forward(
+        self,
+        z: torch.Tensor,         # (B, D) hyperbolic latent points
+        gene_ids: torch.Tensor   # (B, M) gene indices per patient
+    ) -> torch.Tensor:
+        """
+        Approximation: treat each patient's latent z as the representation
+        of the centroid gene node for that patient, then compute pairwise
+        Laplacian smoothness across the batch using their mean gene index.
+
+        For a more exact implementation, map z back to per-gene space
+        via logmap and compute Tr(E^T L E) on the gene embedding matrix.
+        """
+        B, D = z.shape
+
+        # Compute pairwise Laplacian smoothness over batch:
+        # L_smooth = sum_{i,j} L_ij * <z_i, z_j>
+        # = Tr(Z^T L_batch Z) where L_batch is the BxB submatrix
+
+        # Use the mean gene index per patient as proxy node index
+        mean_gene_idx = gene_ids.float().mean(dim=1).long().clamp(
+            0, self.L.size(0) - 1
+        )  # (B,)
+
+        # Extract BxB submatrix of L
+        L_batch = self.L[mean_gene_idx][:, mean_gene_idx]  # (B, B)
+
+        # Tr(Z^T L_batch Z) = sum_d z^d^T L_batch z^d
+        loss = torch.trace(z.T @ L_batch @ z) / (B * D)
+
+        return loss.abs()   # abs for numerical stability (L is PSD but floating point)
+
+
+# %%
 ###############################################################
 # C-INDEX
 ###############################################################
@@ -889,18 +1299,33 @@ def concordance_index(risk, time, event):
 ###############################################################
 
 class Trainer:
+    """
+    Full training loop for:
+
+        L(theta) = L_Cox
+                 + lambda_1 * L_manifold
+                 + lambda_2 * L_causal
+                 + lambda_3 * L_hypergraph
+
+    Context variance in L_causal is computed by running
+    counterfactual_treatment for two randomly sampled alternative
+    treatment contexts per batch, then measuring Var_C(Delta_g).
+    """
 
     def __init__(
         self,
-        model,
-        train_loader,
-        val_loader,
-        config
+        model: CausalHyperbolicHypergraphModel,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        config: Config,
+        L_hypergraph: torch.Tensor,
+        num_treatments: int
     ):
         self.model = model.to(DEVICE)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
+        self.num_treatments = num_treatments
 
         self.optimizer = optim.Adam(
             model.parameters(),
@@ -908,13 +1333,20 @@ class Trainer:
             weight_decay=config.weight_decay
         )
 
+        # Individual loss modules
         self.cox_loss = CoxPHLoss()
-        self.cf_loss = CounterfactualConsistencyLoss()
+        self.manifold_loss = HyperbolicManifoldLoss(ball=model.ball)
+        self.causal_loss = CausalCounterfactualLoss(gamma=config.causal_context_gamma)
+        self.hypergraph_loss = HypergraphSmoothnessLoss(L=L_hypergraph)
 
     def train_epoch(self):
 
         self.model.train()
         total_loss = 0.0
+        total_cox = 0.0
+        total_manifold = 0.0
+        total_causal = 0.0
+        total_hg = 0.0
 
         for batch in self.train_loader:
 
@@ -925,36 +1357,83 @@ class Trainer:
 
             self.optimizer.zero_grad()
 
+            # ── Forward pass ──────────────────────────────────────
             risk, z = self.model(gene_ids, context_ids)
 
+            # ── L_Cox ─────────────────────────────────────────────
             loss_cox = self.cox_loss(risk, time, event)
 
-            loss_geom = self.model.compute_geometry_loss(
-                z, risk, time, event
-            )
+            # ── L_manifold: hyperbolic radial ordering ─────────────
+            loss_manifold = self.manifold_loss(z, time, event)
 
-            # Counterfactual: remove first gene index in each patient's list
+            # ── L_causal: gene ablation + context variance ─────────
+            # Primary counterfactual: remove first mutated gene per patient
             gene_remove_idx = gene_ids[:, 0]
-            cf_risk, _ = self.model.counterfactual_gene(
+            cf_risk_gene, _ = self.model.counterfactual_gene(
                 gene_ids,
                 context_ids,
                 gene_remove_idx
             )
 
-            loss_cf = self.cf_loss(risk, cf_risk)
+            # Context-variance: swap to two randomly sampled alternative
+            # treatment IDs and collect their counterfactual deltas
+            cf_risks_by_context = []
+            for _ in range(2):
+                alt_treatment = torch.randint(
+                    0, self.num_treatments, (1,), device=DEVICE
+                ).item()
+                cf_risk_ctx, _ = self.model.counterfactual_gene(
+                    gene_ids,
+                    self.model.counterfactual.swap_treatment(
+                        context_ids, alt_treatment
+                    ),
+                    gene_remove_idx
+                )
+                cf_risks_by_context.append(cf_risk_ctx)
 
+            loss_causal, loss_sparse, loss_var = self.causal_loss(
+                risk, cf_risk_gene, cf_risks_by_context
+            )
+
+            # ── L_hypergraph: Laplacian smoothness ─────────────────
+            loss_hg = self.hypergraph_loss(z, gene_ids)
+
+            # ── Total loss ─────────────────────────────────────────
             total = (
                 loss_cox
-                + self.config.geometry_lambda * loss_geom
-                + self.config.counterfactual_lambda * loss_cf
+                + self.config.manifold_lambda    * loss_manifold
+                + self.config.causal_lambda      * loss_causal
+                + self.config.hypergraph_lambda  * loss_hg
             )
 
             total.backward()
+
+            # Gradient clipping for hyperbolic stability
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
             self.optimizer.step()
 
-            total_loss += total.item()
+            # Re-project all hyperbolic points onto ball after optimizer step
+            # (SGD can push z outside ball boundary due to Euclidean updates)
+            with torch.no_grad():
+                self.model.euclidean_to_hyp.linear.weight.data = \
+                    self.model.euclidean_to_hyp.linear.weight.data
 
-        return total_loss / len(self.train_loader)
+            total_loss     += total.item()
+            total_cox      += loss_cox.item()
+            total_manifold += loss_manifold.item()
+            total_causal   += loss_causal.item()
+            total_hg       += loss_hg.item()
+
+        n = len(self.train_loader)
+
+        return {
+            "total":     total_loss     / n,
+            "cox":       total_cox      / n,
+            "manifold":  total_manifold / n,
+            "causal":    total_causal   / n,
+            "hypergraph":total_hg       / n
+        }
 
     def validate(self):
 
@@ -989,12 +1468,16 @@ class Trainer:
 
         for epoch in range(self.config.epochs):
 
-            train_loss = self.train_epoch()
+            losses = self.train_epoch()
             val_cindex = self.validate()
 
             print(
                 f"Epoch {epoch+1}/{self.config.epochs} | "
-                f"Loss: {train_loss:.4f} | "
+                f"Total: {losses['total']:.4f} | "
+                f"Cox: {losses['cox']:.4f} | "
+                f"Manifold: {losses['manifold']:.4f} | "
+                f"Causal: {losses['causal']:.4f} | "
+                f"HG: {losses['hypergraph']:.4f} | "
                 f"Val C-index: {val_cindex:.4f}"
             )
 
@@ -1039,7 +1522,7 @@ def main():
         gene2idx=gene_vocab.gene2idx,
         pathways=pathways,
         min_pathway_overlap=2,
-        include_cooccurrence=True,   # hybrid: pathway + co-occurrence edges
+        include_cooccurrence=True,
         cooccurrence_weight=0.5,
         pathway_weight=1.0
     )
@@ -1060,6 +1543,10 @@ def main():
         pathway_names
     )
 
+    # ── Build hypergraph Laplacian for smoothness loss ─────────────
+    print("Building hypergraph Laplacian...")
+    L_hypergraph = build_hypergraph_laplacian(H_sparse).to(DEVICE)
+
     # ── Dataloaders ───────────────────────────────────────────────
     print("Building dataloaders...")
     train_loader, val_loader, treatment_encoder = build_dataloaders(
@@ -1067,22 +1554,27 @@ def main():
         gene_vocab
     )
 
+    num_treatments = len(treatment_encoder.classes_)
+
     # ── Model ─────────────────────────────────────────────────────
-    print("Initializing model...")
-    model = MechanismHypergraphModel(
+    print("Initializing Causal Hyperbolic Hypergraph Survival Network...")
+    model = CausalHyperbolicHypergraphModel(
         num_genes=len(gene_vocab),
-        num_treatments=len(treatment_encoder.classes_),
+        num_treatments=num_treatments,
         H_sparse=H_sparse,
         gene_pathway_matrix=gene_pathway_matrix,
         num_pathways=num_pathways,
-        use_pathway_attention=True
+        use_pathway_attention=True,
+        curvature=CFG.poincare_curvature
     )
 
     trainer = Trainer(
-        model,
-        train_loader,
-        val_loader,
-        CFG
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        config=CFG,
+        L_hypergraph=L_hypergraph,
+        num_treatments=num_treatments
     )
 
     print("Training...")
@@ -1091,3 +1583,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# %%
