@@ -1,0 +1,318 @@
+============================================================
+File: data_clinical_patient.txt
+Columns (26):
+    1. PATIENT_ID
+    2. GENDER
+    3. RACE
+    4. ETHNICITY
+    5. CURRENT_AGE_DEID
+    6. STAGE_HIGHEST_RECORDED
+    7. NUM_ICDO_DX
+    8. ADRENAL_GLANDS
+    9. BONE
+   10. CNS_BRAIN
+   11. INTRA_ABDOMINAL
+   12. LIVER
+   13. LUNG
+   14. LYMPH_NODES
+   15. OTHER
+   16. PLEURA
+   17. REPRODUCTIVE_ORGANS
+   18. SMOKING_PREDICTIONS_3_CLASSES
+   19. GLEASON_FIRST_REPORTED
+   20. GLEASON_HIGHEST_REPORTED
+   21. HISTORY_OF_PDL1
+   22. PRIOR_MED_TO_MSK
+   23. OS_MONTHS
+   24. OS_STATUS
+   25. HR
+   26. HER2
+
+============================================================
+File: data_clinical_sample.txt
+Columns (24):
+    1. SAMPLE_ID
+    2. PATIENT_ID
+    3. GLEASON_SAMPLE_LEVEL
+    4. PDL1_POSITIVE
+    5. CANCER_TYPE
+    6. SAMPLE_TYPE
+    7. SAMPLE_CLASS
+    8. METASTATIC_SITE
+    9. PRIMARY_SITE
+   10. CANCER_TYPE_DETAILED
+   11. GENE_PANEL
+   12. SAMPLE_COVERAGE
+   13. TUMOR_PURITY
+   14. ONCOTREE_CODE
+   15. MSI_COMMENT
+   16. MSI_SCORE
+   17. MSI_TYPE
+   18. SOMATIC_STATUS
+   19. CLINICAL_GROUP
+   20. PATHOLOGICAL_GROUP
+   21. CLINICAL_SUMMARY
+   22. ICD_O_HISTOLOGY_DESCRIPTION
+   23. DIAGNOSIS_DESCRIPTION
+   24. TMB_NONSYNONYMOUS
+
+============================================================
+File: data_cna.txt
+Columns (25035):
+    1. Hugo_Symbol
+    2 - 25035. SAMPLE_IDs
+
+============================================================
+File: data_mutations.txt
+Columns (123):
+    1. Hugo_Symbol
+    2. Entrez_Gene_Id
+    3. Center
+    4. NCBI_Build
+    5. Chromosome
+    6. Start_Position
+    7. End_Position
+    8. Strand
+    9. Consequence
+   10. Variant_Classification
+   11. Variant_Type
+   12. Reference_Allele
+   13. Tumor_Seq_Allele1
+   14. Tumor_Seq_Allele2
+   15. dbSNP_RS
+   16. dbSNP_Val_Status
+   17. Tumor_Sample_Barcode
+   18. Matched_Norm_Sample_Barcode
+   19. Match_Norm_Seq_Allele1
+   20. Match_Norm_Seq_Allele2
+   21. Tumor_Validation_Allele1
+   22. Tumor_Validation_Allele2
+   23. Match_Norm_Validation_Allele1
+   24. Match_Norm_Validation_Allele2
+   25. Verification_Status
+   26. Validation_Status
+   27. Mutation_Status
+   28. Sequencing_Phase
+   29. Sequence_Source
+   30. Validation_Method
+   31. Score
+   32. BAM_File
+   33. Sequencer
+   34. t_ref_count
+   35. t_alt_count
+   36. n_ref_count
+   37. n_alt_count
+   38. HGVSc
+   39. HGVSp
+   40. HGVSp_Short
+   41. Transcript_ID
+   42. RefSeq
+   43. Protein_position
+   44. Codons
+   45. Exon_Number
+   46. COMMENTS
+   47. PATH_SCORE
+   48. AA_MAF
+   49. AFR_MAF
+   50. ALLELE_NUM
+   51. AMR_MAF
+   52. ASN_MAF
+   53. Allele
+   54. Amino_Acid_Change
+   55. Amino_acids
+   56. BIOTYPE
+   57. CANONICAL
+   58. CCDS
+   59. CDS_position
+   60. CLIN_SIG
+   61. Comments
+   62. DISTANCE
+   63. DOMAINS
+   64. EAS_MAF
+   65. EA_MAF
+   66. ENSP
+   67. EUR_MAF
+   68. EXON
+   69. ExAC_AF
+   70. ExAC_AF_AFR
+   71. ExAC_AF_AMR
+   72. ExAC_AF_EAS
+   73. ExAC_AF_FIN
+   74. ExAC_AF_NFE
+   75. ExAC_AF_OTH
+   76. ExAC_AF_SAS
+   77. Existing_variation
+   78. FILTER
+   79. Feature
+   80. Feature_type
+   81. GENE_PHENO
+   82. GMAF
+   83. Gene
+   84. HGNC_ID
+   85. HGVS_OFFSET
+   86. HIGH_INF_POS
+   87. IMPACT
+   88. INTRON
+   89. IS_NEW
+   90. MA:FIS
+   91. MA:FImpact
+   92. MA:link.MSA
+   93. MA:link.PDB
+   94. MA:link.var
+   95. MA:protein.change
+   96. MINIMISED
+   97. MOTIF_NAME
+   98. MOTIF_POS
+   99. MOTIF_SCORE_CHANGE
+  100. PHENO
+  101. PICK
+  102. PUBMED
+  103. PolyPhen
+  104. SAS_MAF
+  105. SIFT
+  106. SOMATIC
+  107. SWISSPROT
+  108. SYMBOL
+  109. SYMBOL_SOURCE
+  110. TREMBL
+  111. TSL
+  112. Transcript
+  113. UNIPARC
+  114. VARIANT_CLASS
+  115. all_effects
+  116. amino_acid_change
+  117. cDNA_Change
+  118. cDNA_position
+  119. cdna_change
+  120. comments
+  121. n_depth
+  122. t_depth
+  123. transcript
+
+============================================================
+File: data_timeline_cancer_presence.txt
+Columns (14):
+    1. PATIENT_ID
+    2. START_DATE
+    3. STOP_DATE
+    4. EVENT_TYPE
+    5. SUBTYPE
+    6. PROCEDURE_TYPE
+    7. CHEST
+    8. ABDOMEN
+    9. PELVIS
+   10. HEAD
+   11. OTHER
+   12. NLP_HAS_CANCER_PROBABILITY
+   13. HAS_CANCER
+   14. STYLE_COLOR
+
+============================================================
+File: data_timeline_cea_labs.txt
+Columns (7):
+    1. PATIENT_ID
+    2. START_DATE
+    3. STOP_DATE
+    4. EVENT_TYPE
+    5. TEST
+    6. RESULT
+    7. LR_UNIT_MEASURE
+
+============================================================
+File: data_timeline_diagnosis.txt
+Columns (12):
+    1. PATIENT_ID
+    2. START_DATE
+    3. STOP_DATE
+    4. EVENT_TYPE
+    5. SUBTYPE
+    6. SOURCE
+    7. DX_DESCRIPTION
+    8. AJCC
+    9. CLINICAL_GROUP
+   10. PATH_GROUP
+   11. STAGE_CDM_DERIVED
+   12. SUMMARY
+
+============================================================
+File: data_timeline_pdl1.txt
+Columns (7):
+    1. PATIENT_ID
+    2. START_DATE
+    3. STOP_DATE
+    4. EVENT_TYPE
+    5. SUBTYPE
+    6. SOURCE
+    7. PDL1_POSITIVE
+
+============================================================
+File: data_timeline_performance_status.txt
+Columns (7):
+    1. PATIENT_ID
+    2. START_DATE
+    3. STOP_DATE
+    4. EVENT_TYPE
+    5. SUBTYPE
+    6. STYLE_COLOR
+    7. ECOG
+
+============================================================
+File: data_timeline_progression.txt
+Columns (9):
+    1. PATIENT_ID
+    2. START_DATE
+    3. STOP_DATE
+    4. EVENT_TYPE
+    5. SUBTYPE
+    6. PROGRESSION
+    7. STYLE_COLOR
+    8. NLP_PROGRESSION_PROBABILITY
+    9. PROCEDURE_TYPE
+
+============================================================
+File: data_timeline_radiation.txt
+Columns (5):
+    1. PATIENT_ID
+    2. START_DATE
+    3. STOP_DATE
+    4. EVENT_TYPE
+    5. SUBTYPE
+
+============================================================
+File: data_timeline_surgery.txt
+Columns (5):
+    1. PATIENT_ID
+    2. START_DATE
+    3. STOP_DATE
+    4. EVENT_TYPE
+    5. SUBTYPE
+
+============================================================
+File: data_timeline_treatment.txt
+Columns (8):
+    1. PATIENT_ID
+    2. START_DATE
+    3. STOP_DATE
+    4. EVENT_TYPE
+    5. SUBTYPE
+    6. AGENT
+    7. RX_INVESTIGATIVE
+    8. FLAG_OROTOPICAL
+
+============================================================
+File: data_timeline_tumor_sites.txt
+Columns (13):
+    1. PATIENT_ID
+    2. START_DATE
+    3. STOP_DATE
+    4. EVENT_TYPE
+    5. SUBTYPE
+    6. SOURCE
+    7. SOURCE_SPECIFIC
+    8. TUMOR_SITE
+    9. CHEST
+   10. ABDOMEN
+   11. PELVIS
+   12. HEAD
+   13. OTHER
+
